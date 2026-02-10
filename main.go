@@ -18,6 +18,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -73,30 +74,6 @@ type ToolContent struct {
 	Text string `json:"text"`
 }
 
-type jsonRPCRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      any             `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
-type jsonRPCResponse struct {
-	JSONRPC string        `json:"jsonrpc"`
-	ID      any           `json:"id,omitempty"`
-	Result  any           `json:"result,omitempty"`
-	Error   *jsonRPCError `json:"error,omitempty"`
-}
-
-type jsonRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-type mcpToolCallParams struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
-}
-
 var (
 	useRegexp     = regexp.MustCompile(`(?i)\buse\s+` + "`?" + `([a-zA-Z0-9_]+)` + "`?")
 	dbTableRegexp = regexp.MustCompile("`?([a-zA-Z0-9_]+)`?\\.`?[a-zA-Z0-9_]+`?")
@@ -109,7 +86,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	if err := srv.Start(ctx); err != nil {
@@ -118,23 +95,102 @@ func main() {
 	}
 	defer srv.Close()
 
-	httpAddr := ":" + defaultString("HTTP_PORT", "8080")
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/mcp", srv.handleMCP)
-
-	httpServer := &http.Server{
-		Addr:    httpAddr,
-		Handler: mux,
-	}
-
-	go handleSignals(cancel, srv, httpServer)
-
-	logInfo("server ready: streamable HTTP endpoint on", httpAddr, "(POST /mcp)")
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logErr("http server error:", err)
+	if err := runStreamableHTTPServer(ctx, srv); err != nil {
+		logErr("HTTP server error:", err)
 		os.Exit(1)
 	}
+}
+
+type QueryParams struct {
+	Query string `json:"query" jsonschema:"SQL statement to execute"`
+}
+
+func runStreamableHTTPServer(ctx context.Context, srv *Server) error {
+	host := defaultString("HTTP_HOST", "0.0.0.0")
+	port := defaultString("HTTP_PORT", "8080")
+	addr := net.JoinHostPort(host, port)
+
+	mcpServer := mcp.NewServer(&mcp.Implementation{
+		Name:    "mcp-mysql",
+		Version: "1.0.0",
+	}, nil)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "mysql_query",
+		Description: "Execute SQL query against configured MySQL (write operations depend on server permissions).",
+	}, srv.handleMySQLQuery)
+
+	handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+		return mcpServer
+	}, nil)
+
+	authToken := strings.TrimSpace(os.Getenv("MCP_AUTH_TOKEN"))
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           withBearerAuth(handler, authToken),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+
+	logInfo("streamable HTTP server ready on", addr)
+	if authToken != "" {
+		logInfo("MCP_AUTH_TOKEN authentication is enabled")
+	}
+
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func withBearerAuth(next http.Handler, token string) http.Handler {
+	if token == "" {
+		return next
+	}
+
+	expected := "Bearer " + token
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(r.Header.Get("Authorization")) != expected {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) handleMySQLQuery(ctx context.Context, req *mcp.CallToolRequest, params *QueryParams) (*mcp.CallToolResult, any, error) {
+	if params == nil || strings.TrimSpace(params.Query) == "" {
+		return nil, nil, errors.New("query is required")
+	}
+
+	res, err := s.ExecuteReadOnlyQuery(ctx, params.Query)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	content := make([]mcp.Content, 0, len(res.Content))
+	for _, c := range res.Content {
+		if c.Type != "text" {
+			continue
+		}
+		content = append(content, &mcp.TextContent{Text: c.Text})
+	}
+	if len(content) == 0 {
+		content = append(content, &mcp.TextContent{Text: ""})
+	}
+
+	return &mcp.CallToolResult{
+		Content: content,
+		IsError: res.IsError,
+	}, res, nil
 }
 
 func NewServerFromEnv() (*Server, error) {
@@ -350,142 +406,6 @@ func (s *Server) executeRowsQuery(ctx context.Context, sqlText string) ([]map[st
 		return nil, err
 	}
 	return result, nil
-}
-
-func handleSignals(cancel context.CancelFunc, srv *Server, httpServer *http.Server) {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	<-ch
-	cancel()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	_ = httpServer.Shutdown(shutdownCtx)
-	srv.Close()
-}
-
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req jsonRPCRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, jsonRPCResponse{
-			JSONRPC: "2.0",
-			Error:   &jsonRPCError{Code: -32700, Message: "parse error"},
-		})
-		return
-	}
-
-	res, hasResponse := s.dispatchMCPRequest(r.Context(), req)
-	if !hasResponse {
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	writeJSON(w, http.StatusOK, res)
-}
-
-func (s *Server) dispatchMCPRequest(ctx context.Context, req jsonRPCRequest) (jsonRPCResponse, bool) {
-	resp := jsonRPCResponse{
-		JSONRPC: "2.0",
-		ID:      req.ID,
-	}
-
-	if req.Method == "notifications/initialized" && req.ID == nil {
-		return jsonRPCResponse{}, false
-	}
-
-	switch req.Method {
-	case "initialize":
-		resp.Result = map[string]any{
-			"protocolVersion": "2025-03-26",
-			"capabilities": map[string]any{
-				"tools": map[string]any{},
-			},
-			"serverInfo": map[string]any{
-				"name":    "mcp-mysql",
-				"version": "0.1.0",
-			},
-		}
-	case "ping":
-		resp.Result = map[string]any{}
-	case "tools/list":
-		resp.Result = map[string]any{
-			"tools": []map[string]any{
-				{
-					"name":        "query",
-					"description": "Execute SQL query against MySQL with schema-based write permissions.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"sql": map[string]any{
-								"type":        "string",
-								"description": "SQL statement to execute.",
-							},
-						},
-						"required": []string{"sql"},
-					},
-				},
-			},
-		}
-	case "tools/call":
-		var params mcpToolCallParams
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			resp.Error = &jsonRPCError{Code: -32602, Message: "invalid params"}
-			return resp, true
-		}
-		if params.Name != "query" {
-			resp.Error = &jsonRPCError{Code: -32602, Message: "unsupported tool name"}
-			return resp, true
-		}
-
-		sqlText, ok := readSQLArgument(params.Arguments)
-		if !ok {
-			resp.Error = &jsonRPCError{Code: -32602, Message: "sql argument is required"}
-			return resp, true
-		}
-
-		toolRes, err := s.ExecuteReadOnlyQuery(ctx, sqlText)
-		if err != nil {
-			toolRes = ToolResult{
-				Content: []ToolContent{{Type: "text", Text: err.Error()}},
-				IsError: true,
-			}
-		}
-		resp.Result = toolRes
-	default:
-		resp.Error = &jsonRPCError{Code: -32601, Message: "method not found"}
-	}
-
-	return resp, true
-}
-
-func readSQLArgument(args map[string]any) (string, bool) {
-	if len(args) == 0 {
-		return "", false
-	}
-	if v, ok := args["sql"].(string); ok && strings.TrimSpace(v) != "" {
-		return v, true
-	}
-	if v, ok := args["query"].(string); ok && strings.TrimSpace(v) != "" {
-		return v, true
-	}
-	return "", false
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func parseSchemaPermissions(s string) SchemaPermissions {
